@@ -20,6 +20,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
@@ -40,6 +41,7 @@ import (
 	"tailscale.com/types/logger"
 	"tailscale.com/util/must"
 	"tailscale.com/util/strs"
+	"tailscale.com/wgengine/capture"
 )
 
 var debugCmd = &ffcli.Command{
@@ -189,6 +191,16 @@ var debugCmd = &ffcli.Command{
 			Name:      "derp",
 			Exec:      runDebugDERP,
 			ShortHelp: "test a DERP configuration",
+		},
+		{
+			Name:      "capture",
+			Exec:      runCapture,
+			ShortHelp: "streams pcaps for debugging",
+			FlagSet: (func() *flag.FlagSet {
+				fs := newFlagSet("capture")
+				fs.StringVar(&captureArgs.outFile, "o", "<wireshark>", "where to stream the pcap, or <wireshark> to start wireshark")
+				return fs
+			})(),
 		},
 	},
 }
@@ -733,4 +745,48 @@ func runSetExpire(ctx context.Context, args []string) error {
 		return errors.New("usage --in=<duration>")
 	}
 	return localClient.DebugSetExpireIn(ctx, setExpireArgs.in)
+}
+
+var captureArgs struct {
+	outFile string
+}
+
+func runCapture(ctx context.Context, args []string) error {
+	stream, err := localClient.StreamDebugCapture(ctx)
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+
+	switch captureArgs.outFile {
+	case "-":
+		fmt.Fprintln(os.Stderr, "Press Ctrl-C to stop the capture.")
+		_, err = io.Copy(os.Stdout, stream)
+		return err
+	case "<wireshark>":
+		lua, err := os.CreateTemp("", "ts-dissector")
+		if err != nil {
+			return err
+		}
+		defer os.Remove(lua.Name())
+		lua.Write([]byte(capture.DissectorLua))
+		if err := lua.Close(); err != nil {
+			return err
+		}
+
+		wireshark := exec.CommandContext(ctx, "wireshark", "-X", "lua_script:"+lua.Name(), "-k", "-i", "-")
+		wireshark.Stdin = stream
+		wireshark.Stdout = os.Stdout
+		wireshark.Stderr = os.Stderr
+		return wireshark.Run()
+	}
+
+	f, err := os.OpenFile(captureArgs.outFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fmt.Fprintln(os.Stderr, "Press Ctrl-C to stop the capture.")
+	_, err = io.Copy(f, stream)
+	return err
 }

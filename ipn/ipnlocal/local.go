@@ -76,6 +76,7 @@ import (
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 	"tailscale.com/wgengine"
+	"tailscale.com/wgengine/capture"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/magicsock"
 	"tailscale.com/wgengine/router"
@@ -147,6 +148,7 @@ type LocalBackend struct {
 	em                    *expiryManager // non-nil
 	sshAtomicBool         atomic.Bool
 	shutdownCalled        bool // if Shutdown has been called
+	debugSink             *capture.Sink
 
 	// lastProfileID tracks the last profile we've seen from the ProfileManager.
 	// It's used to detect when the user has changed their profile.
@@ -516,6 +518,11 @@ func (b *LocalBackend) Shutdown() {
 		b.sshServer = nil
 	}
 	b.closePeerAPIListenersLocked()
+	if b.debugSink != nil {
+		b.e.InstallCaptureHook(nil)
+		b.debugSink.Close()
+		b.debugSink = nil
+	}
 	b.mu.Unlock()
 
 	b.unregisterLinkMon()
@@ -4790,4 +4797,24 @@ func (b *LocalBackend) ResetAuth() error {
 		return err
 	}
 	return b.resetForProfileChangeLockedOnEntry()
+}
+
+// StreamDebugCapture writes a pcap stream of packets traversing
+// tailscaled to the provided response writer.
+func (b *LocalBackend) StreamDebugCapture(w http.ResponseWriter) error {
+	var s *capture.Sink
+
+	b.mu.Lock()
+	if b.debugSink == nil {
+		s = capture.New()
+		b.debugSink = s
+		b.e.InstallCaptureHook(s.LogPacket)
+	} else {
+		s = b.debugSink
+	}
+	b.mu.Unlock()
+
+	s.RegisterOutput(w)
+	s.Wait()
+	return nil
 }
