@@ -71,6 +71,7 @@ var handler = map[string]localAPIHandler{
 	"debug-packet-filter-rules":   (*Handler).serveDebugPacketFilterRules,
 	"derpmap":                     (*Handler).serveDERPMap,
 	"dev-set-state-store":         (*Handler).serveDevSetStateStore,
+	"set-push-device-token":       (*Handler).serveSetPushDeviceToken,
 	"dial":                        (*Handler).serveDial,
 	"file-targets":                (*Handler).serveFileTargets,
 	"goroutines":                  (*Handler).serveGoroutines,
@@ -1196,6 +1197,26 @@ func (h *Handler) serveDial(w http.ResponseWriter, r *http.Request) {
 		errc <- err
 	}()
 	<-errc
+}
+
+func (h *Handler) serveSetPushDeviceToken(w http.ResponseWriter, r *http.Request) {
+	if !h.PermitWrite {
+		http.Error(w, "set push device token access denied", http.StatusForbidden)
+		return
+	}
+	if r.Method != "POST" {
+		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
+		return
+	}
+	var params apitype.SetPushDeviceTokenRequest
+	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
+		http.Error(w, "invalid JSON body", 400)
+		return
+	}
+	if params.PushDeviceToken != "" {
+		hostinfo.SetPushDeviceToken(params.PushDeviceToken)
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func (h *Handler) serveUploadClientMetrics(w http.ResponseWriter, r *http.Request) {
