@@ -32,7 +32,10 @@ import (
 
 	"golang.org/x/crypto/acme"
 	"tailscale.com/envknob"
+	"tailscale.com/hostinfo"
+	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/ipn/store/kubestore"
 	"tailscale.com/types/logger"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
@@ -94,9 +97,9 @@ func (b *LocalBackend) GetCertPEM(ctx context.Context, domain string) (*TLSCertK
 		log.Printf("acme %T: %s", v, j)
 	}
 
-	if pair, ok := getCertPEMCached(dir, domain, now); ok {
+	if pair, ok := b.getCertPEMCached(dir, domain, now); ok {
 		future := now.AddDate(0, 0, 14)
-		if shouldStartDomainRenewal(dir, domain, future) {
+		if b.shouldStartDomainRenewal(dir, domain, future) {
 			logf("starting async renewal")
 			// Start renewal in the background.
 			go b.getCertPEM(context.Background(), logf, traceACME, dir, domain, future)
@@ -112,7 +115,7 @@ func (b *LocalBackend) GetCertPEM(ctx context.Context, domain string) (*TLSCertK
 	return pair, nil
 }
 
-func shouldStartDomainRenewal(dir, domain string, future time.Time) bool {
+func (b *LocalBackend) shouldStartDomainRenewal(dir, domain string, future time.Time) bool {
 	renewMu.Lock()
 	defer renewMu.Unlock()
 	now := time.Now()
@@ -122,8 +125,78 @@ func shouldStartDomainRenewal(dir, domain string, future time.Time) bool {
 		return false
 	}
 	lastRenewCheck[domain] = now
-	_, ok := getCertPEMCached(dir, domain, future)
+	_, ok := b.getCertPEMCached(dir, domain, future)
 	return !ok
+}
+
+// certStore provides a way to perist and retrieve TLS certificates.
+// As of 2023-02-01, we use store certs in directories on disk everywhere
+// except on Kubernetes, where we use the state store.
+type certStore interface {
+	Read(domain string, now time.Time) (*TLSCertKeyPair, error)
+	WriteCert(domain string, cert []byte) error
+	WriteKey(domain string, key []byte) error
+}
+
+func (b *LocalBackend) getCertStore(dir string) certStore {
+	if hostinfo.GetEnvType() == hostinfo.Kubernetes {
+		if _, ok := b.store.(*kubestore.Store); ok && dir == "/tmp" {
+			return certStateStore{b.store}
+		}
+	}
+	return certFileStore(dir)
+}
+
+type certFileStore string // dir
+
+func (f certFileStore) Read(domain string, now time.Time) (*TLSCertKeyPair, error) {
+	certPEM, err := os.ReadFile(keyFile(string(f), domain))
+	if err != nil {
+		return nil, err
+	}
+	keyPEM, err := os.ReadFile(certFile(string(f), domain))
+	if err != nil {
+		return nil, err
+	}
+	if !validCertPEM(domain, keyPEM, certPEM, now) {
+		return nil, errors.New("invalid cert")
+	}
+	return &TLSCertKeyPair{CertPEM: certPEM, KeyPEM: keyPEM, Cached: true}, nil
+}
+
+func (f certFileStore) WriteCert(domain string, cert []byte) error {
+	return os.WriteFile(keyFile(string(f), domain), cert, 0644)
+}
+
+func (f certFileStore) WriteKey(domain string, key []byte) error {
+	return os.WriteFile(keyFile(string(f), domain), key, 0600)
+}
+
+type certStateStore struct {
+	ipn.StateStore
+}
+
+func (s certStateStore) Read(domain string, now time.Time) (*TLSCertKeyPair, error) {
+	certPEM, err := s.ReadState(ipn.StateKey(domain + ".crt"))
+	if err != nil {
+		return nil, err
+	}
+	keyPEM, err := s.ReadState(ipn.StateKey(domain + ".key"))
+	if err != nil {
+		return nil, err
+	}
+	if !validCertPEM(domain, keyPEM, certPEM, now) {
+		return nil, errors.New("invalid cert")
+	}
+	return &TLSCertKeyPair{CertPEM: certPEM, KeyPEM: keyPEM, Cached: true}, nil
+}
+
+func (s certStateStore) WriteCert(domain string, cert []byte) error {
+	return s.WriteState(ipn.StateKey(domain+".crt"), cert)
+}
+
+func (s certStateStore) WriteKey(domain string, key []byte) error {
+	return s.WriteState(ipn.StateKey(domain+".key"), key)
 }
 
 // TLSCertKeyPair is a TLS public and private key, and whether they were obtained
@@ -140,26 +213,24 @@ func certFile(dir, domain string) string { return filepath.Join(dir, domain+".cr
 // getCertPEMCached returns a non-nil keyPair and true if a cached
 // keypair for domain exists on disk in dir that is valid at the
 // provided now time.
-func getCertPEMCached(dir, domain string, now time.Time) (p *TLSCertKeyPair, ok bool) {
+func (b *LocalBackend) getCertPEMCached(dir, domain string, now time.Time) (p *TLSCertKeyPair, ok bool) {
 	if !validLookingCertDomain(domain) {
 		// Before we read files from disk using it, validate it's halfway
 		// reasonable looking.
 		return nil, false
 	}
-	if keyPEM, err := os.ReadFile(keyFile(dir, domain)); err == nil {
-		certPEM, _ := os.ReadFile(certFile(dir, domain))
-		if validCertPEM(domain, keyPEM, certPEM, now) {
-			return &TLSCertKeyPair{CertPEM: certPEM, KeyPEM: keyPEM, Cached: true}, true
-		}
+	p, err := b.getCertStore(dir).Read(domain, now)
+	if err != nil {
+		return nil, false
 	}
-	return nil, false
+	return p, true
 }
 
 func (b *LocalBackend) getCertPEM(ctx context.Context, logf logger.Logf, traceACME func(any), dir, domain string, now time.Time) (*TLSCertKeyPair, error) {
 	acmeMu.Lock()
 	defer acmeMu.Unlock()
 
-	if p, ok := getCertPEMCached(dir, domain, now); ok {
+	if p, ok := b.getCertPEMCached(dir, domain, now); ok {
 		return p, nil
 	}
 
@@ -274,7 +345,8 @@ func (b *LocalBackend) getCertPEM(ctx context.Context, logf logger.Logf, traceAC
 	if err := encodeECDSAKey(&privPEM, certPrivKey); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(keyFile(dir, domain), privPEM.Bytes(), 0600); err != nil {
+	certStore := b.getCertStore(dir)
+	if err := certStore.WriteKey(domain, privPEM.Bytes()); err != nil {
 		return nil, err
 	}
 
@@ -297,7 +369,7 @@ func (b *LocalBackend) getCertPEM(ctx context.Context, logf logger.Logf, traceAC
 			return nil, err
 		}
 	}
-	if err := os.WriteFile(certFile(dir, domain), certPEM.Bytes(), 0644); err != nil {
+	if err := certStore.WriteCert(domain, certPEM.Bytes()); err != nil {
 		return nil, err
 	}
 
